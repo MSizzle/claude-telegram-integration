@@ -1,0 +1,25 @@
+# Local runtime state (contains session IDs, project names)
+telegram-approve.json
+telegram-approve.state
+telegram-listener.pid
+telegram-poll.lock
+
+# Credentials — never commit
+.env
+.env.*
+!.env.example
+telegram-config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo

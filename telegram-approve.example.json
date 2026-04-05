@@ -1,0 +1,15 @@
+{
+  "_comment": "Example state file. The real telegram-approve.json is auto-created at ~/.claude/telegram-approve.json on first run. Do not commit the real file — it contains session IDs and project names.",
+  "default": "on",
+  "projects": {
+    "example-project": "auto",
+    "another-project": "off"
+  },
+  "active": {
+    "example-project": {
+      "name": "example-project",
+      "session_id": "00000000-0000-0000-0000-000000000000",
+      "last_seen": 0
+    }
+  }
+}
