@@ -2,6 +2,27 @@
 # Simple Telegram notifier. Credentials loaded from env or ~/.claude/telegram-config.json.
 
 CONFIG="$HOME/.claude/telegram-config.json"
+STATE="$HOME/.claude/telegram-approve.json"
+
+# Check if this project's mode is "off" — if so, send nothing.
+PROJECT=$(basename "$PWD")
+PROJECT_LOWER=$(echo "$PROJECT" | tr '[:upper:]' '[:lower:]')
+
+if [ -f "$STATE" ]; then
+  MODE=$(/usr/bin/python3 -c "
+import json, sys
+state = json.load(open(sys.argv[1]))
+key = sys.argv[2]
+projects = state.get('projects', {})
+if key in projects:
+    print(projects[key])
+else:
+    print(state.get('default', 'on'))
+" "$STATE" "$PROJECT_LOWER" 2>/dev/null)
+  if [ "$MODE" = "off" ]; then
+    exit 0
+  fi
+fi
 
 TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 CHAT_ID="${TELEGRAM_CHAT_ID:-}"
@@ -18,7 +39,6 @@ if [ -z "$TOKEN" ] || [ -z "$CHAT_ID" ]; then
   exit 0
 fi
 
-PROJECT=$(basename "$PWD")
 curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
   -d chat_id="${CHAT_ID}" \
   --data-urlencode "text=🔔 [$PROJECT] $1" > /dev/null

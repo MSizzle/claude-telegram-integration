@@ -111,10 +111,14 @@ def save_state(state):
         k: v for k, v in state.get("active", {}).items()
         if now - v.get("last_seen", 0) < 1800
     }
-    with open(STATE_FILE, "w") as f:
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         json.dump(state, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
         fcntl.flock(f, fcntl.LOCK_UN)
+    os.replace(tmp, STATE_FILE)
 
 
 # ── Telegram ──
@@ -204,14 +208,16 @@ def build_projects_keyboard(state):
         name = projects[key]
         # Truncate for button label (Telegram shows limited width anyway)
         short = name if len(name) <= 22 else name[:20] + "…"
+        # Telegram callback_data is limited to 64 bytes; truncate key to stay safe
+        cb_key = key[:50]
         # Header row: project name as a no-op info button
-        rows.append([{"text": f"— {short} —", "callback_data": f"pn:{key}"}])
+        rows.append([{"text": f"— {short} —", "callback_data": f"pn:{cb_key}"}])
         # Action row
         rows.append([
-            {"text": "✅ on", "callback_data": f"pm:{key}:on"},
-            {"text": "🔇 off", "callback_data": f"pm:{key}:off"},
-            {"text": "🚀 auto", "callback_data": f"pm:{key}:auto"},
-            {"text": "🧹 clear", "callback_data": f"pm:{key}:clear"},
+            {"text": "✅ on", "callback_data": f"pm:{cb_key}:on"},
+            {"text": "🔇 off", "callback_data": f"pm:{cb_key}:off"},
+            {"text": "🚀 auto", "callback_data": f"pm:{cb_key}:auto"},
+            {"text": "🧹 clear", "callback_data": f"pm:{cb_key}:clear"},
         ])
     rows.append([{"text": "🔄 Refresh", "callback_data": "pr:refresh"}])
     return {"inline_keyboard": rows}
@@ -460,9 +466,15 @@ def main():
     )
 
     last_update_id = 0
-    flush = telegram_request("getUpdates", {"offset": -1, "limit": 1, "timeout": 0})
-    if flush and flush.get("ok") and flush["result"]:
-        last_update_id = flush["result"][-1]["update_id"] + 1
+    # Drain and process any pending updates from before startup
+    drain = telegram_request("getUpdates", {"offset": 0, "limit": 100, "timeout": 0})
+    if drain and drain.get("ok"):
+        for update in drain.get("result", []):
+            last_update_id = update["update_id"] + 1
+            msg = update.get("message")
+            if msg and msg.get("text", ""):
+                if str(msg.get("chat", {}).get("id", "")) == str(CHAT_ID) and is_allowed_sender(msg.get("from")):
+                    handle_command(msg["text"].strip())
 
     while True:
         result = telegram_request("getUpdates", {

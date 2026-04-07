@@ -34,6 +34,7 @@ STATE_FILE = os.path.expanduser("~/.claude/telegram-approve.json")
 CONFIG_FILE = os.path.expanduser("~/.claude/telegram-config.json")
 LISTENER_PID_FILE = os.path.expanduser("~/.claude/telegram-listener.pid")
 POLL_LOCK_FILE = os.path.expanduser("~/.claude/telegram-poll.lock")
+PAUSE_TIMESTAMP_FILE = os.path.expanduser("~/.claude/telegram-listener-paused-at")
 VALID_MODES = ("on", "off", "auto")
 
 
@@ -95,6 +96,9 @@ def pause_listener():
             with open(LISTENER_PID_FILE) as f:
                 pid = int(f.read().strip())
             os.kill(pid, signal.SIGSTOP)
+            # Record when we paused so the listener can self-recover
+            with open(PAUSE_TIMESTAMP_FILE, "w") as f:
+                f.write(str(int(time.time())))
             return pid
         except (ValueError, ProcessLookupError, PermissionError, FileNotFoundError):
             pass
@@ -106,6 +110,36 @@ def resume_listener(pid):
         try:
             os.kill(pid, signal.SIGCONT)
         except (ProcessLookupError, PermissionError):
+            pass
+    # Always clean up the pause timestamp
+    try:
+        os.remove(PAUSE_TIMESTAMP_FILE)
+    except FileNotFoundError:
+        pass
+
+
+def rescue_stale_listener():
+    """Resume the listener if it's been paused for too long (>60s).
+
+    This handles the case where an approve script crashed or was killed
+    without running __exit__, leaving the listener frozen via SIGSTOP.
+    """
+    if not os.path.exists(PAUSE_TIMESTAMP_FILE):
+        return
+    try:
+        with open(PAUSE_TIMESTAMP_FILE) as f:
+            paused_at = int(f.read().strip())
+        if int(time.time()) - paused_at > 60:
+            # Listener has been paused too long — rescue it
+            if os.path.exists(LISTENER_PID_FILE):
+                with open(LISTENER_PID_FILE) as f:
+                    pid = int(f.read().strip())
+                os.kill(pid, signal.SIGCONT)
+            os.remove(PAUSE_TIMESTAMP_FILE)
+    except (ValueError, FileNotFoundError, ProcessLookupError, PermissionError):
+        try:
+            os.remove(PAUSE_TIMESTAMP_FILE)
+        except FileNotFoundError:
             pass
 
 
@@ -120,6 +154,9 @@ class PollSession:
         self.listener_pid = None
 
     def __enter__(self):
+        # Before acquiring the lock, rescue a listener that may have been
+        # left frozen by a previous crashed approve script.
+        rescue_stale_listener()
         try:
             self.lock_fh = open(POLL_LOCK_FILE, "w")
             fcntl.flock(self.lock_fh, fcntl.LOCK_EX)
@@ -248,10 +285,14 @@ def load_state():
 
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         json.dump(state, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
         fcntl.flock(f, fcntl.LOCK_UN)
+    os.replace(tmp, STATE_FILE)
 
 
 def get_mode_for_project(project):
@@ -451,12 +492,14 @@ def build_projects_keyboard(state):
     for key in sorted(projects, key=lambda k: projects[k].lower()):
         name = projects[key]
         short = name if len(name) <= 22 else name[:20] + "…"
-        rows.append([{"text": f"— {short} —", "callback_data": f"pn:{key}"}])
+        # Telegram callback_data is limited to 64 bytes; truncate key to stay safe
+        cb_key = key[:50]
+        rows.append([{"text": f"— {short} —", "callback_data": f"pn:{cb_key}"}])
         rows.append([
-            {"text": "✅ on", "callback_data": f"pm:{key}:on"},
-            {"text": "🔇 off", "callback_data": f"pm:{key}:off"},
-            {"text": "🚀 auto", "callback_data": f"pm:{key}:auto"},
-            {"text": "🧹 clear", "callback_data": f"pm:{key}:clear"},
+            {"text": "✅ on", "callback_data": f"pm:{cb_key}:on"},
+            {"text": "🔇 off", "callback_data": f"pm:{cb_key}:off"},
+            {"text": "🚀 auto", "callback_data": f"pm:{cb_key}:auto"},
+            {"text": "🧹 clear", "callback_data": f"pm:{cb_key}:clear"},
         ])
     rows.append([{"text": "🔄 Refresh", "callback_data": "pr:refresh"}])
     return {"inline_keyboard": rows}
@@ -541,6 +584,9 @@ def handle_project_callback(cb):
 # ── Command Handling ──
 
 def handle_command(text):
+    """Process a Telegram command. Returns the mode set ('on'/'off'/'auto')
+    if a mode-change command was processed, True for other handled commands,
+    or False if the text was not a command."""
     text = text.strip()
     lower = text.lower()
     labels = {"on": "Interactive ✅", "off": "OFF 🔇", "auto": "Auto-approve 🚀"}
@@ -562,12 +608,12 @@ def handle_command(text):
                 )
             else:
                 send_message(f"{code(parts[0])} has no override — already using global default")
-            return True
+            return "clear"
         elif cmd in VALID_MODES:
             state["projects"][project_name] = cmd
             save_state(state)
             send_message(f"🎯 {code(parts[0])} → {b(labels[cmd])}")
-            return True
+            return cmd
         else:
             send_message(f"Unknown mode {code(cmd)}. Use: on, off, auto, clear")
             return True
@@ -577,19 +623,19 @@ def handle_command(text):
         state["default"] = "on"
         save_state(state)
         send_message("✅ <b>Global: Interactive mode ON</b>\n\nApprove/Deny buttons for all projects (unless overridden).")
-        return True
+        return "on"
     elif lower == "/off":
         state = load_state()
         state["default"] = "off"
         save_state(state)
         send_message("🔇 <b>Global: Approvals OFF</b>\n\nAll projects use terminal prompts (unless overridden).")
-        return True
+        return "off"
     elif lower == "/auto":
         state = load_state()
         state["default"] = "auto"
         save_state(state)
         send_message("🚀 <b>Global: Auto-approve ON</b>\n\nAll projects auto-approved with summaries (unless overridden).\n\n🚩 Dangerous commands always require manual approval.")
-        return True
+        return "auto"
     elif lower == "/status":
         state = load_state()
         msg = f"📊 <b>Status</b>\n\n<b>Global:</b> {esc(labels.get(state['default'], state['default']))}\n"
@@ -660,13 +706,44 @@ def handle_command(text):
 
 # ── Polling ──
 
-def poll_for_response(request_id, msg_id):
+def poll_for_response(request_id, msg_id, project):
     start = time.time()
     last_update_id = 0
+    mode_changed = False
 
-    flush = telegram_request("getUpdates", {"offset": -1, "limit": 1, "timeout": 0})
-    if flush and flush.get("ok") and flush["result"]:
-        last_update_id = flush["result"][-1]["update_id"] + 1
+    def _check_off_after_command(cmd_result):
+        """After a command is processed, check if this project is now off."""
+        if not cmd_result:
+            return False
+        # Re-read the mode for this project — it may have changed
+        new_mode = get_mode_for_project(project)
+        if new_mode == "off":
+            telegram_request("editMessageText", {
+                "chat_id": CHAT_ID,
+                "message_id": msg_id,
+                "text": "🔇 <b>Cancelled</b> — approvals turned OFF",
+                "parse_mode": "HTML",
+            })
+            return True
+        return False
+
+    # Drain pending updates WITHOUT discarding them — process commands
+    # that arrived before this poll started (e.g. /off sent by user).
+    drain = telegram_request("getUpdates", {"offset": 0, "limit": 100, "timeout": 0})
+    if drain and drain.get("ok"):
+        for update in drain.get("result", []):
+            last_update_id = update["update_id"] + 1
+            msg = update.get("message")
+            if msg and msg.get("text", ""):
+                if str(msg.get("chat", {}).get("id", "")) == str(CHAT_ID) and is_allowed_sender(msg.get("from")):
+                    result = handle_command(msg["text"])
+                    if _check_off_after_command(result):
+                        return "deny"
+            cb = update.get("callback_query")
+            if cb and is_allowed_sender(cb.get("from")):
+                if handle_project_callback(cb):
+                    if _check_off_after_command(True):
+                        return "deny"
 
     while time.time() - start < TIMEOUT:
         result = telegram_request("getUpdates", {
@@ -687,7 +764,9 @@ def poll_for_response(request_id, msg_id):
             if msg and msg.get("text", ""):
                 # Only trust messages from the configured chat
                 if str(msg.get("chat", {}).get("id", "")) == str(CHAT_ID) and is_allowed_sender(msg.get("from")):
-                    handle_command(msg["text"])
+                    cmd_result = handle_command(msg["text"])
+                    if _check_off_after_command(cmd_result):
+                        return "deny"
                 continue
 
             cb = update.get("callback_query")
@@ -707,6 +786,8 @@ def poll_for_response(request_id, msg_id):
 
             # Project-picker buttons from /projects keyboard
             if handle_project_callback(cb):
+                if _check_off_after_command(True):
+                    return "deny"
                 continue
 
             if data.endswith(f":{request_id}"):
@@ -763,6 +844,9 @@ def main():
 
     register_session(project, session_id)
 
+    # Rescue the listener if a previous approve script left it frozen.
+    rescue_stale_listener()
+
     mode = get_mode_for_project(project)
 
     # OFF — fall through to terminal
@@ -796,7 +880,7 @@ def main():
             # Couldn't reach Telegram — fall through to terminal
             sys.exit(0)
 
-        decision = poll_for_response(request_id, msg_id)
+        decision = poll_for_response(request_id, msg_id, project)
 
     if decision == "approve":
         print(json.dumps(approve_output()))

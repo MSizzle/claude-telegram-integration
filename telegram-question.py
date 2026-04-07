@@ -25,6 +25,7 @@ STATE_FILE = os.path.expanduser("~/.claude/telegram-approve.json")
 CONFIG_FILE = os.path.expanduser("~/.claude/telegram-config.json")
 LISTENER_PID_FILE = os.path.expanduser("~/.claude/telegram-listener.pid")
 POLL_LOCK_FILE = os.path.expanduser("~/.claude/telegram-poll.lock")
+PAUSE_TIMESTAMP_FILE = os.path.expanduser("~/.claude/telegram-listener-paused-at")
 
 
 # ── Credentials ──
@@ -76,6 +77,8 @@ def pause_listener():
             with open(LISTENER_PID_FILE) as f:
                 pid = int(f.read().strip())
             os.kill(pid, signal.SIGSTOP)
+            with open(PAUSE_TIMESTAMP_FILE, "w") as f:
+                f.write(str(int(time.time())))
             return pid
         except (ValueError, ProcessLookupError, PermissionError, FileNotFoundError):
             pass
@@ -88,6 +91,30 @@ def resume_listener(pid):
             os.kill(pid, signal.SIGCONT)
         except (ProcessLookupError, PermissionError):
             pass
+    try:
+        os.remove(PAUSE_TIMESTAMP_FILE)
+    except FileNotFoundError:
+        pass
+
+
+def rescue_stale_listener():
+    """Resume the listener if it's been paused for too long (>60s)."""
+    if not os.path.exists(PAUSE_TIMESTAMP_FILE):
+        return
+    try:
+        with open(PAUSE_TIMESTAMP_FILE) as f:
+            paused_at = int(f.read().strip())
+        if int(time.time()) - paused_at > 60:
+            if os.path.exists(LISTENER_PID_FILE):
+                with open(LISTENER_PID_FILE) as f:
+                    pid = int(f.read().strip())
+                os.kill(pid, signal.SIGCONT)
+            os.remove(PAUSE_TIMESTAMP_FILE)
+    except (ValueError, FileNotFoundError, ProcessLookupError, PermissionError):
+        try:
+            os.remove(PAUSE_TIMESTAMP_FILE)
+        except FileNotFoundError:
+            pass
 
 
 class PollSession:
@@ -98,6 +125,7 @@ class PollSession:
         self.listener_pid = None
 
     def __enter__(self):
+        rescue_stale_listener()
         try:
             self.lock_fh = open(POLL_LOCK_FILE, "w")
             fcntl.flock(self.lock_fh, fcntl.LOCK_EX)
@@ -185,10 +213,14 @@ def save_state(state):
         k: v for k, v in state.get("active", {}).items()
         if now - v.get("last_seen", 0) < 1800
     }
-    with open(STATE_FILE, "w") as f:
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         json.dump(state, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
         fcntl.flock(f, fcntl.LOCK_UN)
+    os.replace(tmp, STATE_FILE)
 
 
 def collect_projects(state):
@@ -229,12 +261,14 @@ def build_projects_keyboard(state):
     for key in sorted(projects, key=lambda k: projects[k].lower()):
         name = projects[key]
         short = name if len(name) <= 22 else name[:20] + "…"
-        rows.append([{"text": f"— {short} —", "callback_data": f"pn:{key}"}])
+        # Telegram callback_data is limited to 64 bytes; truncate key to stay safe
+        cb_key = key[:50]
+        rows.append([{"text": f"— {short} —", "callback_data": f"pn:{cb_key}"}])
         rows.append([
-            {"text": "✅ on", "callback_data": f"pm:{key}:on"},
-            {"text": "🔇 off", "callback_data": f"pm:{key}:off"},
-            {"text": "🚀 auto", "callback_data": f"pm:{key}:auto"},
-            {"text": "🧹 clear", "callback_data": f"pm:{key}:clear"},
+            {"text": "✅ on", "callback_data": f"pm:{cb_key}:on"},
+            {"text": "🔇 off", "callback_data": f"pm:{cb_key}:off"},
+            {"text": "🚀 auto", "callback_data": f"pm:{cb_key}:auto"},
+            {"text": "🧹 clear", "callback_data": f"pm:{cb_key}:clear"},
         ])
     rows.append([{"text": "🔄 Refresh", "callback_data": "pr:refresh"}])
     return {"inline_keyboard": rows}
@@ -375,15 +409,174 @@ def build_multi_keyboard(options, selected, request_id):
     return {"inline_keyboard": buttons}
 
 
-def poll_for_answer(request_id, msg_id, options, multi_select=False):
+def handle_command(text):
+    """Process mode-change commands that arrive during question polling.
+    Returns the mode set ('on'/'off'/'auto'/'clear') for mode changes,
+    True for other handled commands, False if not a command."""
+    lower = text.strip().lower()
+    labels = {"on": "Interactive ✅", "off": "OFF 🔇", "auto": "Auto-approve 🚀"}
+
+    if lower in ("/on", "/off", "/auto"):
+        mode = lower[1:]
+        state = load_state()
+        state["default"] = mode
+        save_state(state)
+        send_message(f"✅ Global → {esc(labels[mode])}")
+        return mode
+
+    if text.startswith("@") and " " in text:
+        parts = text[1:].split(None, 1)
+        project_name = parts[0].lower()
+        cmd = parts[1].lower().strip()
+        state = load_state()
+        if cmd in VALID_MODES:
+            state.setdefault("projects", {})[project_name] = cmd
+            save_state(state)
+            send_message(f"🎯 {code(parts[0])} → {esc(labels[cmd])}")
+            return cmd
+        elif cmd == "clear":
+            if project_name in state.get("projects", {}):
+                del state["projects"][project_name]
+                save_state(state)
+            send_message(f"🔄 {code(parts[0])} — override cleared")
+            return "clear"
+
+    return False
+
+
+def poll_for_text(msg_id, project):
+    """Poll for a free-text response (no inline buttons)."""
+    start = time.time()
+    last_update_id = 0
+
+    def _check_off_after_command(cmd_result):
+        if not cmd_result:
+            return False
+        new_mode = get_mode_for_project(project)
+        if new_mode == "off":
+            telegram_request("editMessageText", {
+                "chat_id": CHAT_ID,
+                "message_id": msg_id,
+                "text": "🔇 <b>Cancelled</b> — approvals turned OFF",
+                "parse_mode": "HTML",
+            })
+            return True
+        return False
+
+    # Drain pending updates — process commands.
+    drain = telegram_request("getUpdates", {"offset": 0, "limit": 100, "timeout": 0})
+    if drain and drain.get("ok"):
+        for update in drain.get("result", []):
+            last_update_id = update["update_id"] + 1
+            msg = update.get("message")
+            if msg and msg.get("text", ""):
+                if str(msg.get("chat", {}).get("id", "")) == str(CHAT_ID) and is_allowed_sender(msg.get("from")):
+                    result = handle_command(msg["text"])
+                    if _check_off_after_command(result):
+                        return None
+            cb = update.get("callback_query")
+            if cb and is_allowed_sender(cb.get("from")):
+                if handle_project_callback(cb):
+                    if _check_off_after_command(True):
+                        return None
+
+    while time.time() - start < TIMEOUT:
+        result = telegram_request("getUpdates", {
+            "offset": last_update_id,
+            "limit": 10,
+            "timeout": 2,
+            "allowed_updates": ["callback_query", "message"],
+        })
+
+        if not result or not result.get("ok"):
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        for update in result.get("result", []):
+            last_update_id = update["update_id"] + 1
+
+            msg = update.get("message")
+            if msg and msg.get("text", ""):
+                if str(msg.get("chat", {}).get("id", "")) != str(CHAT_ID):
+                    continue
+                if not is_allowed_sender(msg.get("from")):
+                    continue
+
+                text = msg["text"].strip()
+                # Process mode-change commands
+                if text.startswith("/") or text.startswith("@"):
+                    cmd_result = handle_command(text)
+                    if _check_off_after_command(cmd_result):
+                        return None
+                    continue
+
+                # Any other text is the user's answer
+                telegram_request("editMessageText", {
+                    "chat_id": CHAT_ID,
+                    "message_id": msg_id,
+                    "text": f"💬 <b>Answered:</b> {esc(text)}",
+                    "parse_mode": "HTML",
+                })
+                return text
+
+            cb = update.get("callback_query")
+            if cb and is_allowed_sender(cb.get("from")):
+                if handle_project_callback(cb):
+                    if _check_off_after_command(True):
+                        return None
+                else:
+                    telegram_request("answerCallbackQuery", {
+                        "callback_query_id": cb.get("id"),
+                    })
+
+        time.sleep(POLL_INTERVAL)
+
+    telegram_request("editMessageText", {
+        "chat_id": CHAT_ID,
+        "message_id": msg_id,
+        "text": "⏰ <b>Timed out</b> — no answer received, falling back to terminal",
+        "parse_mode": "HTML",
+    })
+    return None
+
+
+def poll_for_answer(request_id, msg_id, options, project, multi_select=False):
     start = time.time()
     last_update_id = 0
     selected = set()
     waiting_for_text = False
 
-    flush = telegram_request("getUpdates", {"offset": -1, "limit": 1, "timeout": 0})
-    if flush and flush.get("ok") and flush["result"]:
-        last_update_id = flush["result"][-1]["update_id"] + 1
+    def _check_off_after_command(cmd_result):
+        """After a command, check if this project is now off."""
+        if not cmd_result:
+            return False
+        new_mode = get_mode_for_project(project)
+        if new_mode == "off":
+            telegram_request("editMessageText", {
+                "chat_id": CHAT_ID,
+                "message_id": msg_id,
+                "text": "🔇 <b>Cancelled</b> — approvals turned OFF",
+                "parse_mode": "HTML",
+            })
+            return True
+        return False
+
+    # Drain pending updates WITHOUT discarding them — process commands.
+    drain = telegram_request("getUpdates", {"offset": 0, "limit": 100, "timeout": 0})
+    if drain and drain.get("ok"):
+        for update in drain.get("result", []):
+            last_update_id = update["update_id"] + 1
+            msg = update.get("message")
+            if msg and msg.get("text", ""):
+                if str(msg.get("chat", {}).get("id", "")) == str(CHAT_ID) and is_allowed_sender(msg.get("from")):
+                    result = handle_command(msg["text"])
+                    if _check_off_after_command(result):
+                        return None
+            cb = update.get("callback_query")
+            if cb and is_allowed_sender(cb.get("from")):
+                if handle_project_callback(cb):
+                    if _check_off_after_command(True):
+                        return None
 
     while time.time() - start < TIMEOUT:
         result = telegram_request("getUpdates", {
@@ -409,10 +602,13 @@ def poll_for_answer(request_id, msg_id, options, multi_select=False):
                     continue
 
                 text = msg["text"].strip()
+                # Always process mode-change commands, even mid-question
+                if text.startswith("/") or text.startswith("@"):
+                    cmd_result = handle_command(text)
+                    if _check_off_after_command(cmd_result):
+                        return None
+                    continue
                 if waiting_for_text:
-                    # Skip commands the user may have typed — they aren't the answer
-                    if text.startswith("/") or text.startswith("@"):
-                        continue
                     telegram_request("editMessageText", {
                         "chat_id": CHAT_ID,
                         "message_id": msg_id,
@@ -438,6 +634,8 @@ def poll_for_answer(request_id, msg_id, options, multi_select=False):
 
             # Project-picker buttons — handle inline so they work during a pending question
             if handle_project_callback(cb):
+                if _check_off_after_command(True):
+                    return None
                 continue
 
             if not data.startswith(f"q:{request_id}:"):
@@ -469,8 +667,8 @@ def poll_for_answer(request_id, msg_id, options, multi_select=False):
                         })
                         continue
 
-                    labels = [options[i]["label"] for i in sorted(selected)]
-                    answer = ", ".join(labels)
+                    labels_list = [options[i]["label"] for i in sorted(selected)]
+                    answer = ", ".join(labels_list)
 
                     telegram_request("answerCallbackQuery", {
                         "callback_query_id": cb_id,
@@ -483,27 +681,43 @@ def poll_for_answer(request_id, msg_id, options, multi_select=False):
                         "parse_mode": "HTML",
                     })
                     return answer
-                else:
+
+                try:
                     idx = int(choice)
-                    if idx in selected:
-                        selected.discard(idx)
-                    else:
-                        selected.add(idx)
-
-                    telegram_request("answerCallbackQuery", {
-                        "callback_query_id": cb_id,
-                        "text": f"{'Selected' if idx in selected else 'Deselected'}: {options[idx]['label'][:30]}",
-                    })
-
-                    new_keyboard = build_multi_keyboard(options, selected, request_id)
-                    telegram_request("editMessageReplyMarkup", {
-                        "chat_id": CHAT_ID,
-                        "message_id": msg_id,
-                        "reply_markup": new_keyboard,
-                    })
+                except (ValueError, TypeError):
+                    telegram_request("answerCallbackQuery", {"callback_query_id": cb_id})
                     continue
+                if idx < 0 or idx >= len(options):
+                    telegram_request("answerCallbackQuery", {"callback_query_id": cb_id})
+                    continue
+
+                if idx in selected:
+                    selected.discard(idx)
+                else:
+                    selected.add(idx)
+
+                telegram_request("answerCallbackQuery", {
+                    "callback_query_id": cb_id,
+                    "text": f"{'Selected' if idx in selected else 'Deselected'}: {options[idx]['label'][:30]}",
+                })
+
+                new_keyboard = build_multi_keyboard(options, selected, request_id)
+                telegram_request("editMessageReplyMarkup", {
+                    "chat_id": CHAT_ID,
+                    "message_id": msg_id,
+                    "reply_markup": new_keyboard,
+                })
+                continue
             else:
-                idx = int(choice)
+                try:
+                    idx = int(choice)
+                except (ValueError, TypeError):
+                    telegram_request("answerCallbackQuery", {"callback_query_id": cb_id})
+                    continue
+                if idx < 0 or idx >= len(options):
+                    telegram_request("answerCallbackQuery", {"callback_query_id": cb_id})
+                    continue
+
                 label = options[idx]["label"]
 
                 telegram_request("answerCallbackQuery", {
@@ -547,11 +761,6 @@ def main():
     if not questions:
         sys.exit(0)
 
-    # Validate up front so we don't pause the listener for nothing.
-    for q in questions:
-        if not q.get("options"):
-            sys.exit(0)
-
     answers = {}
 
     with PollSession():
@@ -563,17 +772,26 @@ def main():
             request_id = uuid.uuid4().hex[:8]
             message = format_question(project, q_data)
 
-            if multi:
-                keyboard = build_multi_keyboard(options, set(), request_id)
+            if options:
+                if multi:
+                    keyboard = build_multi_keyboard(options, set(), request_id)
+                else:
+                    keyboard = build_keyboard(options, request_id)
             else:
-                keyboard = build_keyboard(options, request_id)
+                # Free-text question — no predefined options, just a text prompt
+                keyboard = None
+                message += "\n<i>Type your answer below:</i>"
 
             msg_id = send_message(message, reply_markup=keyboard)
             if not msg_id:
                 # Couldn't send — bail and let terminal handle it.
                 sys.exit(0)
 
-            answer = poll_for_answer(request_id, msg_id, options, multi_select=multi)
+            if options:
+                answer = poll_for_answer(request_id, msg_id, options, project, multi_select=multi)
+            else:
+                answer = poll_for_text(msg_id, project)
+
             if answer is None:
                 # Timed out — fall through to terminal.
                 sys.exit(0)
