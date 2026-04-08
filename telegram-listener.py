@@ -10,8 +10,9 @@ file-based IPC instead of calling Telegram directly:
 Commands:
   /on          — global interactive mode
   /off         — global disabled
-  /auto        — global auto-approve
-  @Project on  — per-project override (on/off/auto/clear)
+  /auto        — global auto-approve (with notifications)
+  /ffw         — fast-forward (silent, only risky actions prompt)
+  @Project on  — per-project override (on/off/auto/ffw/clear)
   /projects    — tap-to-set mode per project
   /status      — show all modes
   /quo         — show active sessions and their modes
@@ -36,7 +37,7 @@ CONFIG_FILE = os.path.expanduser("~/.claude/telegram-config.json")
 PID_FILE = os.path.expanduser("~/.claude/telegram-listener.pid")
 PENDING_DIR = os.path.expanduser("~/.claude/telegram-pending")
 RESPONSE_DIR = os.path.expanduser("~/.claude/telegram-responses")
-VALID_MODES = ("on", "off", "auto")
+VALID_MODES = ("on", "off", "auto", "ffw")
 
 # In-memory tracking of requests awaiting user response.
 # Maps request_id → {uuid, msg_id, type, project, options, multi_select,
@@ -352,8 +353,8 @@ def build_multi_keyboard(options, selected, request_id):
 
 # ── Project picker keyboard ──
 
-MODE_ICONS = {"on": "✅", "off": "🔇", "auto": "🚀"}
-MODE_LABELS = {"on": "Interactive ✅", "off": "OFF 🔇", "auto": "Auto-approve 🚀"}
+MODE_ICONS = {"on": "✅", "off": "🔇", "auto": "🚀", "ffw": "⏩"}
+MODE_LABELS = {"on": "Interactive ✅", "off": "OFF 🔇", "auto": "Auto-approve 🚀", "ffw": "Fast-forward ⏩"}
 
 
 def collect_projects(state):
@@ -401,6 +402,7 @@ def build_projects_keyboard(state):
             {"text": "✅ on", "callback_data": f"pm:{cb_key}:on"},
             {"text": "🔇 off", "callback_data": f"pm:{cb_key}:off"},
             {"text": "🚀 auto", "callback_data": f"pm:{cb_key}:auto"},
+            {"text": "⏩ ffw", "callback_data": f"pm:{cb_key}:ffw"},
             {"text": "🧹 clear", "callback_data": f"pm:{cb_key}:clear"},
         ])
     rows.append([{"text": "🔄 Refresh", "callback_data": "pr:refresh"}])
@@ -610,7 +612,7 @@ def handle_question_callback(request_id, choice, cb_id):
 def handle_command(text):
     text = text.strip()
     lower = text.lower()
-    labels = {"on": "Interactive ✅", "off": "OFF 🔇", "auto": "Auto-approve 🚀"}
+    labels = {"on": "Interactive ✅", "off": "OFF 🔇", "auto": "Auto-approve 🚀", "ffw": "Fast-forward ⏩"}
 
     if text.startswith("@") and " " in text:
         parts = text[1:].split(None, 1)
@@ -676,6 +678,18 @@ def handle_command(text):
         save_state(state)
         send_message("🚀 <b>Global: Auto-approve ON</b>\n\nAll projects auto-approved with summaries (unless overridden).")
         return True
+    elif lower == "/ffw" or lower == "/ffw on":
+        state = load_state()
+        state["default"] = "ffw"
+        save_state(state)
+        send_message("⏩ <b>Global: Fast-forward ON</b>\n\nSilent auto-approve — only risky actions require approval. No notification spam.")
+        return True
+    elif lower == "/ffw off":
+        state = load_state()
+        state["default"] = "on"
+        save_state(state)
+        send_message("✅ <b>Fast-forward OFF</b> — back to interactive mode.")
+        return True
     elif lower == "/status":
         state = load_state()
         msg = f"📊 <b>Status</b>\n\n<b>Global:</b> {esc(labels.get(state['default'], state['default']))}\n"
@@ -729,7 +743,7 @@ def handle_command(text):
         msg += f"\n<b>Global default:</b> {esc(labels.get(state['default'], state['default']))}"
         send_message(msg)
         return True
-    elif lower == "/projects":
+    elif lower in ("/projects", "/menu"):
         state = load_state()
         send_message(
             format_projects_text(state),
@@ -745,9 +759,10 @@ def handle_command(text):
             "🤖 <b>Commands</b>\n\n"
             "/on — global interactive mode\n"
             "/off — global disabled\n"
-            "/auto — global auto-approve\n"
-            "/projects — tap-to-set mode per project\n"
-            "@Project on — per-project (on/off/auto/clear)\n"
+            "/auto — global auto-approve (with notifications)\n"
+            "/ffw — fast-forward (silent, only risky actions prompt)\n"
+            "/projects /menu — tap-to-set mode per project\n"
+            "@Project on — per-project (on/off/auto/ffw/clear)\n"
             "/status — show all modes\n"
             "/quo — active sessions queue\n"
             "/stop — stop listener"
@@ -775,13 +790,13 @@ def main():
             save_state({"default": old_mode, "projects": {}, "active": {}})
         os.remove(old_state)
 
-    labels = {"on": "Interactive ✅", "off": "OFF 🔇", "auto": "Auto-approve 🚀"}
+    labels = {"on": "Interactive ✅", "off": "OFF 🔇", "auto": "Auto-approve 🚀", "ffw": "Fast-forward ⏩"}
     state = load_state()
     mode = state["default"]
     send_message(
         f"🤖 <b>Telegram listener started</b>\n\n"
         f"<b>Global mode:</b> {esc(labels.get(mode, mode))}\n\n"
-        f"Commands: /on /off /auto /projects /status /quo /help /stop\n"
+        f"Commands: /on /off /auto /ffw /projects /status /quo /help /stop\n"
         f"Per-project: @ProjectName on/off/auto/clear"
     )
 

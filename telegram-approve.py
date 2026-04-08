@@ -27,7 +27,7 @@ CONFIG_FILE = os.path.expanduser("~/.claude/telegram-config.json")
 PID_FILE = os.path.expanduser("~/.claude/telegram-listener.pid")
 PENDING_DIR = os.path.expanduser("~/.claude/telegram-pending")
 RESPONSE_DIR = os.path.expanduser("~/.claude/telegram-responses")
-VALID_MODES = ("on", "off", "auto")
+VALID_MODES = ("on", "off", "auto", "ffw")
 
 
 # ── HTML formatting helpers ──
@@ -365,8 +365,13 @@ def main():
 
     risks = detect_risks(hook_input)
 
+    # FFW mode — silent auto-approve for safe commands, only prompt for risky ones
+    if mode == "ffw" and not risks:
+        print(json.dumps(approve_output()))
+        sys.exit(0)
+
     # AUTO mode, safe command — fire-and-forget notification, auto-approve
-    if mode == "auto" and not risks:
+    if mode in ("auto", "ffw") and not risks:
         _, description = describe_action(hook_input)
         write_request({
             "type": "notify",
