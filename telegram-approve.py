@@ -21,12 +21,13 @@ import fcntl
 import re
 import html as _html
 
-TIMEOUT = 120
+TIMEOUT = 600  # 10 minutes — tap ⏳ +5m in Telegram to extend
 STATE_FILE = os.path.expanduser("~/.claude/telegram-approve.json")
 CONFIG_FILE = os.path.expanduser("~/.claude/telegram-config.json")
 PID_FILE = os.path.expanduser("~/.claude/telegram-listener.pid")
 PENDING_DIR = os.path.expanduser("~/.claude/telegram-pending")
 RESPONSE_DIR = os.path.expanduser("~/.claude/telegram-responses")
+HEARTBEAT_DIR = os.path.expanduser("~/.claude/telegram-heartbeats")
 VALID_MODES = ("on", "off", "auto", "ffw")
 
 
@@ -116,50 +117,40 @@ SENSITIVE_FILES = (
     ".git/config", ".netrc", "secrets",
 )
 
-DANGEROUS_PATTERNS = [
-    (r"\brm\s+(-[a-zA-Z]*[rf])", "Recursive/forced file deletion"),
-    (r"\brm\s+.*(/|~|\$HOME)", "Deleting files from a broad path"),
-    (r"git\s+push\s+.*--force", "Force pushing (can overwrite remote history)"),
-    (r"git\s+push\s+-f\b", "Force pushing (can overwrite remote history)"),
-    (r"git\s+reset\s+--hard", "Hard reset (discards all uncommitted changes)"),
-    (r"git\s+clean\s+.*-[a-zA-Z]*f", "Force cleaning untracked files"),
-    (r"git\s+checkout\s+\.\s*$", "Discarding all local changes"),
-    (r"git\s+branch\s+.*-D\b", "Force deleting a branch"),
-    (r"\bsudo\b", "Running with superuser privileges"),
-    (r"\bchmod\s+777\b", "Setting world-writable permissions"),
-    (r"\bchown\b.*(/etc|/usr|/System)", "Changing ownership of system files"),
-    (r"\bdd\s+", "Low-level disk write (dd)"),
-    (r"\bmkfs\b", "Formatting a filesystem"),
-    (r"\bfdisk\b", "Modifying disk partitions"),
-    (r"\bdiskutil\s+(erase|partition)", "Erasing or partitioning a disk"),
-    (r"\bkill\s+-9\b", "Force killing a process"),
-    (r"\bkillall\b", "Killing processes by name"),
-    (r"\bpkill\b", "Killing processes by pattern"),
-    (r"curl\s.*\|\s*(sh|bash|zsh)", "Piping downloaded script to shell"),
-    (r"wget\s.*\|\s*(sh|bash|zsh)", "Piping downloaded script to shell"),
-    (r"curl\s.*\|\s*python", "Piping downloaded script to Python"),
-    (r"\bDROP\s+(TABLE|DATABASE|SCHEMA)\b", "Dropping a database object"),
-    (r"\bTRUNCATE\b", "Truncating a table"),
-    (r"\bDELETE\s+FROM\b.*WHERE\s+1\s*=\s*1", "Deleting all rows"),
-    (r"\bDELETE\s+FROM\b(?!.*WHERE)", "DELETE without WHERE clause"),
-    (r"\bunset\b.*(PATH|HOME|USER|SHELL)", "Unsetting critical env variable"),
-    (r">\s*/dev/sd", "Writing directly to a disk device"),
-    (r"/etc/hosts\b", "Modifying hosts file"),
-    (r"\biptables\b", "Modifying firewall rules"),
-    (r"npm\s+publish\b", "Publishing a package to npm"),
-    (r"npm\s+unpublish\b", "Unpublishing a package from npm"),
+# Two-tier heuristic (replaces the old blacklist).
+#
+# Tier 1 — Always Safe: Bash commands starting with any of these are
+# bypassed (auto-approved) in auto and ffw modes. Must NOT match a
+# Tier 2 pattern (Tier 2 always wins).
+SAFE_PREFIXES = (
+    "ls", "cat", "grep", "pwd",
+    "git status", "git diff", "git log",
+    "npm test", "pytest", "cargo test",
+    "which",
+)
+
+# Tier 2 — High Danger: escalate to manual approval regardless of mode.
+HIGH_DANGER_PATTERNS = [
+    (r"\bsudo\b", "sudo — superuser execution"),
+    (r"\brm\s+-[a-zA-Z]*[rRfF]", "rm -rf — recursive/forced delete"),
+    (r"git\s+push\b[^|;&]*--force", "git push --force — can overwrite remote history"),
+    (r"git\s+push\s+[^|;&]*\s-f\b", "git push -f — can overwrite remote history"),
+    (r">\s*/dev/", "Redirect to /dev/ device"),
+    (r"\bchmod\b", "chmod — changing file permissions"),
+    (r"\bchown\b", "chown — changing file ownership"),
+    (r"\|\s*(bash|sh|zsh|ksh|dash)\b", "Pipe into shell interpreter"),
 ]
 
 
 def detect_risks(hook_input):
+    """High-danger reasons only — drives the 🚩 danger view and manual-approval gating."""
     risks = []
     tool = hook_input.get("tool_name", "")
     tool_input = hook_input.get("tool_input", {})
-    cwd = hook_input.get("cwd", "")
 
     if tool == "Bash":
         cmd = tool_input.get("command", "")
-        for pattern, reason in DANGEROUS_PATTERNS:
+        for pattern, reason in HIGH_DANGER_PATTERNS:
             if re.search(pattern, cmd, re.IGNORECASE):
                 risks.append(reason)
         for sp in SYSTEM_PATHS:
@@ -181,16 +172,23 @@ def detect_risks(hook_input):
             if sf in fp:
                 risks.append(f"Modifying sensitive file containing {sf}")
                 break
-        if cwd and fp and not fp.startswith(cwd):
-            home = os.path.expanduser("~")
-            safe_outside = (
-                os.path.join(home, ".claude/"),
-                os.path.join(home, ".config/"),
-            )
-            if not any(fp.startswith(s) for s in safe_outside):
-                risks.append("Writing outside project directory")
 
     return list(dict.fromkeys(risks))
+
+
+def classify(hook_input):
+    """Return (tier, risks). tier ∈ {'safe', 'normal', 'high_danger'}."""
+    risks = detect_risks(hook_input)
+    if risks:
+        return "high_danger", risks
+
+    tool = hook_input.get("tool_name", "")
+    if tool == "Bash":
+        cmd = hook_input.get("tool_input", {}).get("command", "").lstrip()
+        for prefix in SAFE_PREFIXES:
+            if cmd == prefix or cmd.startswith(prefix + " "):
+                return "safe", []
+    return "normal", []
 
 
 # ── Describe Actions ──
@@ -312,11 +310,26 @@ def write_request(data):
     os.replace(tmp, path)
 
 
+def read_heartbeat(req_uuid):
+    """Read the heartbeat file written by the listener when user taps ⏳ +5m."""
+    path = os.path.join(HEARTBEAT_DIR, f"{req_uuid}.json")
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, IOError):
+        return None
+
+
 def poll_response(req_uuid, timeout):
-    """Poll for a response file. Returns parsed JSON or None on timeout."""
+    """Poll for a response file. Returns parsed JSON or None on timeout.
+
+    Honors heartbeat extensions: if the listener writes a heartbeat file
+    with a later deadline (user tapped ⏳ +5m), we extend the wait.
+    """
     path = os.path.join(RESPONSE_DIR, f"{req_uuid}.json")
     start = time.time()
-    while time.time() - start < timeout:
+    deadline = start + timeout
+    while time.time() < deadline:
         if os.path.exists(path):
             try:
                 with open(path) as f:
@@ -326,6 +339,11 @@ def poll_response(req_uuid, timeout):
             except (json.JSONDecodeError, IOError):
                 time.sleep(0.2)
                 continue
+        hb = read_heartbeat(req_uuid)
+        if hb:
+            new_deadline = hb.get("deadline")
+            if isinstance(new_deadline, (int, float)) and new_deadline > deadline:
+                deadline = new_deadline
         time.sleep(0.5)
     return None
 
@@ -363,24 +381,24 @@ def main():
     if not listener_alive():
         sys.exit(0)
 
-    risks = detect_risks(hook_input)
+    tier, risks = classify(hook_input)
 
-    # FFW mode — silent auto-approve for safe commands, only prompt for risky ones
-    if mode == "ffw" and not risks:
-        print(json.dumps(approve_output()))
-        sys.exit(0)
-
-    # AUTO mode, safe command — fire-and-forget notification, auto-approve
-    if mode in ("auto", "ffw") and not risks:
-        _, description = describe_action(hook_input)
-        write_request({
-            "type": "notify",
-            "id": uuid.uuid4().hex,
-            "message_html": f"⚡ <b>Auto-approved</b> — {code(project)}\n\n{description}",
-            "created_at": int(time.time()),
-        })
-        print(json.dumps(approve_output()))
-        sys.exit(0)
+    # Tier 2 (high danger) ALWAYS escalates to manual approval, even in auto/ffw.
+    # Tier 1 (safe) and normal fall through to the mode's auto-approve path.
+    if tier != "high_danger":
+        if mode == "ffw":
+            print(json.dumps(approve_output()))
+            sys.exit(0)
+        if mode == "auto":
+            _, description = describe_action(hook_input)
+            write_request({
+                "type": "notify",
+                "id": uuid.uuid4().hex,
+                "message_html": f"⚡ <b>Auto-approved</b> — {code(project)}\n\n{description}",
+                "created_at": int(time.time()),
+            })
+            print(json.dumps(approve_output()))
+            sys.exit(0)
 
     # Interactive approval — send request, wait for response
     request_id = uuid.uuid4().hex[:8]
@@ -412,7 +430,7 @@ def main():
         print(json.dumps(approve_output()))
         sys.exit(0)
     else:
-        reason = "dangerous command" if risks else "Telegram"
+        reason = "dangerous command" if tier == "high_danger" else "Telegram"
         print(f"Denied via {reason}", file=sys.stderr)
         sys.exit(2)
 

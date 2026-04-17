@@ -37,7 +37,9 @@ CONFIG_FILE = os.path.expanduser("~/.claude/telegram-config.json")
 PID_FILE = os.path.expanduser("~/.claude/telegram-listener.pid")
 PENDING_DIR = os.path.expanduser("~/.claude/telegram-pending")
 RESPONSE_DIR = os.path.expanduser("~/.claude/telegram-responses")
+HEARTBEAT_DIR = os.path.expanduser("~/.claude/telegram-heartbeats")
 VALID_MODES = ("on", "off", "auto", "ffw")
+EXTEND_SECONDS = 300  # "⏳ +5m" button
 
 # In-memory tracking of requests awaiting user response.
 # Maps request_id → {uuid, msg_id, type, project, options, multi_select,
@@ -158,13 +160,23 @@ def send_message(text, reply_markup=None):
     return None
 
 
-def edit_message(msg_id, text):
-    telegram_request("editMessageText", {
+def edit_message(msg_id, text, strip_keyboard=False, reply_markup=None):
+    """Edit a message's text. Optionally replace or strip its inline keyboard.
+
+    strip_keyboard=True removes the inline keyboard (passes an empty
+    inline_keyboard — stale buttons vanish from chat history).
+    """
+    data = {
         "chat_id": CHAT_ID,
         "message_id": msg_id,
         "text": text,
         "parse_mode": "HTML",
-    })
+    }
+    if reply_markup is not None:
+        data["reply_markup"] = reply_markup
+    elif strip_keyboard:
+        data["reply_markup"] = {"inline_keyboard": []}
+    telegram_request("editMessageText", data)
 
 
 def edit_keyboard(msg_id, reply_markup):
@@ -173,6 +185,23 @@ def edit_keyboard(msg_id, reply_markup):
         "message_id": msg_id,
         "reply_markup": reply_markup,
     })
+
+
+def resolve_message(req, marker, suffix=""):
+    """Finalize a resolved/expired request: prepend the outcome marker,
+    preserve the original context, and strip the now-stale inline keyboard.
+
+    marker examples: "✅ <b>[APPROVED]</b>", "❌ <b>[DENIED]</b>",
+    "⌛ <b>[EXPIRED]</b>", "🔇 <b>[CANCELLED]</b>".
+    """
+    original = req.get("message_html") or ""
+    text = f"{marker}\n\n{original}" if original else marker
+    if suffix:
+        text = f"{text}\n\n{suffix}"
+    # Telegram caps message text at 4096 chars — leave headroom.
+    if len(text) > 4000:
+        text = text[:4000] + "…"
+    edit_message(req["msg_id"], text, strip_keyboard=True)
 
 
 def answer_cb(cb_id, text=None):
@@ -193,18 +222,41 @@ def is_allowed_sender(from_obj):
 def ensure_dirs():
     os.makedirs(PENDING_DIR, exist_ok=True)
     os.makedirs(RESPONSE_DIR, exist_ok=True)
+    os.makedirs(HEARTBEAT_DIR, exist_ok=True)
 
 
 def cleanup_stale_files():
-    """Remove request/response files older than 5 minutes on startup."""
+    """Remove request/response/heartbeat files older than 5 minutes on startup."""
     now = time.time()
-    for d in (PENDING_DIR, RESPONSE_DIR):
+    for d in (PENDING_DIR, RESPONSE_DIR, HEARTBEAT_DIR):
+        if not os.path.isdir(d):
+            continue
         for path in _glob.glob(os.path.join(d, "*.json")):
             try:
                 if now - os.path.getmtime(path) > 300:
                     os.remove(path)
             except OSError:
                 pass
+
+
+def remove_heartbeat(req_uuid):
+    try:
+        os.remove(os.path.join(HEARTBEAT_DIR, f"{req_uuid}.json"))
+    except OSError:
+        pass
+
+
+def write_heartbeat(req_uuid, deadline_epoch):
+    """Signal telegram-approve.py that this request's deadline has been extended."""
+    os.makedirs(HEARTBEAT_DIR, exist_ok=True)
+    path = os.path.join(HEARTBEAT_DIR, f"{req_uuid}.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"deadline": int(deadline_epoch),
+                   "updated_at": int(time.time())}, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def write_response(req_uuid, data):
@@ -215,6 +267,8 @@ def write_response(req_uuid, data):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    # Request is resolved — heartbeat (if any) is no longer relevant
+    remove_heartbeat(req_uuid)
 
 
 def scan_pending_requests():
@@ -240,11 +294,36 @@ def scan_pending_requests():
             send_message(req.get("message_html", ""))
             continue
 
-        # Send message with keyboard
-        msg_id = send_message(
-            req.get("message_html", ""),
-            reply_markup=req.get("keyboard"),
-        )
+        message_html = req.get("message_html", "")
+        keyboard = req.get("keyboard")
+        options = req.get("options", [])
+
+        # Free-text question: no options → user must type an answer.
+        # Prepend a clear banner and replace the keyboard with a Cancel button.
+        free_text = (req_type == "question" and not options)
+        if free_text:
+            banner = (
+                "⚠️ <b>CLAUDE IS WAITING FOR TEXT INPUT</b> ⚠️\n"
+                "Please type your response below.\n\n"
+            )
+            message_html = banner + message_html
+            keyboard = {
+                "inline_keyboard": [[
+                    {"text": "❌ Cancel Question",
+                     "callback_data": f"cancel_q:{request_id}"},
+                ]]
+            }
+
+        # Append a "⏳ +5m" extension button to every approval request.
+        if req_type == "approve":
+            rows = list(keyboard.get("inline_keyboard", [])) if keyboard else []
+            rows.append([{
+                "text": "⏳ +5m",
+                "callback_data": f"ext:{request_id}",
+            }])
+            keyboard = {"inline_keyboard": rows}
+
+        msg_id = send_message(message_html, reply_markup=keyboard)
         if not msg_id:
             # Couldn't send — tell hook to fall through to terminal
             if req_uuid:
@@ -260,12 +339,17 @@ def scan_pending_requests():
             "msg_id": msg_id,
             "type": req_type,
             "project": req.get("project", ""),
-            "options": req.get("options", []),
+            "options": options,
             "multi_select": req.get("multi_select", False),
             "selected": set(),
-            "waiting_for_text": False,
+            # Free-text questions start in "waiting for text" mode so the
+            # very next message from CHAT_ID is routed back as the answer.
+            "waiting_for_text": free_text,
             "timeout": req.get("timeout", 120),
             "created_at": req.get("created_at", time.time()),
+            # Kept so resolve_message can preserve original context when it
+            # strips stale buttons on approve/deny/expire/cancel.
+            "message_html": message_html,
         }
 
 
@@ -278,8 +362,8 @@ def expire_stale_requests():
     ]
     for rid in to_expire:
         req = active_requests.pop(rid)
-        edit_message(req["msg_id"],
-                     "⏰ <b>Timed out</b> — no response received")
+        resolve_message(req, "⌛ <b>[EXPIRED]</b>",
+                        suffix="<i>No response received before timeout.</i>")
         write_response(req["uuid"], {
             "answer": "timeout",
             "responded_at": int(now),
@@ -290,8 +374,8 @@ def cancel_all_requests():
     """Cancel every active request (used when global mode → off)."""
     for rid in list(active_requests.keys()):
         req = active_requests.pop(rid)
-        edit_message(req["msg_id"],
-                     "🔇 <b>Cancelled</b> — approvals turned OFF")
+        resolve_message(req, "🔇 <b>[CANCELLED]</b>",
+                        suffix="<i>Approvals turned OFF globally.</i>")
         write_response(req["uuid"], {
             "answer": "cancelled",
             "responded_at": int(time.time()),
@@ -306,8 +390,8 @@ def cancel_requests_for_project(project_key):
     ]
     for rid in to_cancel:
         req = active_requests.pop(rid)
-        edit_message(req["msg_id"],
-                     "🔇 <b>Cancelled</b> — approvals turned OFF")
+        resolve_message(req, "🔇 <b>[CANCELLED]</b>",
+                        suffix="<i>This project's approvals turned OFF.</i>")
         write_response(req["uuid"], {
             "answer": "cancelled",
             "responded_at": int(time.time()),
@@ -409,15 +493,128 @@ def build_projects_keyboard(state):
     return {"inline_keyboard": rows}
 
 
+# Track which messages were sent as the full /menu (vs. bare /projects) so
+# callbacks that re-render the message preserve the correct view.
+menu_message_ids = set()
+
+
+def format_menu_text(state):
+    labels = MODE_LABELS
+    lines = [
+        "🤖 <b>Menu</b>",
+        "",
+        f"<b>Global mode:</b> {esc(labels.get(state['default'], state['default']))}",
+    ]
+    if state.get("projects"):
+        lines.append("")
+        lines.append("<b>Per-project overrides:</b>")
+        for proj, mode in sorted(state["projects"].items()):
+            lines.append(f"  {code(proj)} → {esc(labels.get(mode, mode))}")
+    if active_requests:
+        waiting = sum(1 for r in active_requests.values()
+                      if r.get("waiting_for_text"))
+        line = f"<b>Pending:</b> {len(active_requests)}"
+        if waiting:
+            line += f" · ⚠️ waiting for text: {waiting}"
+        lines.append("")
+        lines.append(line)
+    lines += [
+        "",
+        "<b>All commands</b>",
+        "/on /off /auto /ffw — global mode",
+        "@ProjectName on|off|auto|ffw|clear — per-project",
+        "/status /quo /projects /help /stop",
+        "",
+        "<i>Tap a button below to act.</i>",
+    ]
+    return "\n".join(lines)
+
+
+def build_menu_keyboard(state):
+    rows = [
+        [{"text": "— Global Mode —",
+          "callback_data": "menu_info:global"}],
+        [
+            {"text": "✅ on", "callback_data": "menu_act:on"},
+            {"text": "🔇 off", "callback_data": "menu_act:off"},
+            {"text": "🚀 auto", "callback_data": "menu_act:auto"},
+            {"text": "⏩ ffw", "callback_data": "menu_act:ffw"},
+        ],
+        [{"text": "— Actions —", "callback_data": "menu_info:actions"}],
+        [
+            {"text": "📊 Status", "callback_data": "menu_act:status"},
+            {"text": "📋 Queue", "callback_data": "menu_act:quo"},
+            {"text": "❓ Help", "callback_data": "menu_act:help"},
+        ],
+        [{"text": "— Projects —", "callback_data": "menu_info:projects"}],
+    ]
+    # Project picker rows (tap-to-set per-project overrides + refresh).
+    rows.extend(build_projects_keyboard(state)["inline_keyboard"])
+    return {"inline_keyboard": rows}
+
+
 def refresh_projects_message(msg_id):
+    """Re-render an existing message. Picks menu vs. bare-projects view
+    based on which command originally sent it."""
     state = load_state()
+    if msg_id in menu_message_ids:
+        text = format_menu_text(state)
+        kb = build_menu_keyboard(state)
+    else:
+        text = format_projects_text(state)
+        kb = build_projects_keyboard(state)
     telegram_request("editMessageText", {
         "chat_id": CHAT_ID,
         "message_id": msg_id,
-        "text": format_projects_text(state),
+        "text": text,
         "parse_mode": "HTML",
-        "reply_markup": build_projects_keyboard(state),
+        "reply_markup": kb,
     })
+
+
+def handle_menu_callback(cb):
+    """Handle the /menu-specific action buttons. Returns True if handled."""
+    data = cb.get("data", "")
+    if not (data.startswith("menu_act:") or data.startswith("menu_info:")):
+        return False
+
+    cb_id = cb.get("id")
+    msg = cb.get("message", {}) or {}
+    msg_id = msg.get("message_id")
+
+    if data.startswith("menu_info:"):
+        state = load_state()
+        what = data.split(":", 1)[1]
+        if what == "global":
+            answer_cb(cb_id,
+                      f"Global: {MODE_LABELS.get(state['default'], state['default'])}")
+        elif what == "projects":
+            cnt = len(state.get("projects", {}))
+            answer_cb(cb_id, f"{cnt} override(s)" if cnt else "No overrides")
+        else:
+            answer_cb(cb_id)
+        return True
+
+    action = data.split(":", 1)[1]
+
+    if action in VALID_MODES:
+        state = load_state()
+        state["default"] = action
+        save_state(state)
+        if action == "off":
+            cancel_all_requests()
+        answer_cb(cb_id, f"Global → {MODE_LABELS.get(action, action)}")
+        if msg_id:
+            refresh_projects_message(msg_id)
+        return True
+
+    if action in ("status", "quo", "help"):
+        answer_cb(cb_id)
+        handle_command(f"/{action}")
+        return True
+
+    answer_cb(cb_id)
+    return True
 
 
 def handle_project_callback(cb):
@@ -493,8 +690,45 @@ def handle_callback(cb):
     data = cb.get("data", "")
     cb_id = cb.get("id")
 
+    # /menu action/info buttons (global modes, status/quo/help shortcuts)
+    if handle_menu_callback(cb):
+        return
+
     # Project picker buttons
     if handle_project_callback(cb):
+        return
+
+    # ⏳ +5m — extend a pending approval's deadline
+    if data.startswith("ext:"):
+        request_id = data.split(":", 1)[1]
+        req = active_requests.get(request_id)
+        if not req:
+            answer_cb(cb_id, "Request already resolved")
+            return
+        now = time.time()
+        current_deadline = req["created_at"] + req["timeout"]
+        # Never shrink the deadline — always guarantee at least +5m from now.
+        new_deadline = max(current_deadline, now + EXTEND_SECONDS)
+        req["timeout"] = new_deadline - req["created_at"]
+        write_heartbeat(req["uuid"], new_deadline)
+        total_min = int((new_deadline - req["created_at"]) / 60)
+        answer_cb(cb_id, f"⏳ Extended — {total_min} min total")
+        return
+
+    # ❌ Cancel Question — abort a free-text question waiting for input
+    if data.startswith("cancel_q:"):
+        request_id = data.split(":", 1)[1]
+        req = active_requests.pop(request_id, None)
+        if not req:
+            answer_cb(cb_id, "Already resolved")
+            return
+        answer_cb(cb_id, "Cancelled")
+        resolve_message(req, "❌ <b>[CANCELLED]</b>",
+                        suffix="<i>Question cancelled by user.</i>")
+        write_response(req["uuid"], {
+            "answer": "cancelled",
+            "responded_at": int(time.time()),
+        })
         return
 
     # Approve / Deny
@@ -507,10 +741,11 @@ def handle_callback(cb):
             req = active_requests.pop(request_id)
             answer_cb(cb_id,
                        "Approved ✅" if action == "approve" else "Denied ❌")
-            status = "✅ <b>Approved</b>" if action == "approve" else "❌ <b>Denied</b>"
             elapsed = int(time.time() - req["created_at"])
-            edit_message(req["msg_id"],
-                         f"{status}\n\n(responded in {elapsed}s)")
+            marker = ("✅ <b>[APPROVED]</b>" if action == "approve"
+                      else "❌ <b>[DENIED]</b>")
+            resolve_message(req, marker,
+                            suffix=f"<i>(responded in {elapsed}s)</i>")
             write_response(req["uuid"], {
                 "answer": action,
                 "responded_at": int(time.time()),
@@ -539,10 +774,22 @@ def handle_question_callback(request_id, choice, cb_id):
     req = active_requests[request_id]
     options = req["options"]
 
-    # "Other" — switch to free-text mode
+    # "Other" — transition to free-text mode: banner + Cancel button only.
     if choice == "other":
         answer_cb(cb_id, "Type your answer below...")
-        edit_message(req["msg_id"], "💬 <b>Type your answer:</b>")
+        banner = (
+            "⚠️ <b>CLAUDE IS WAITING FOR TEXT INPUT</b> ⚠️\n"
+            "Please type your response below."
+        )
+        cancel_kb = {
+            "inline_keyboard": [[
+                {"text": "❌ Cancel Question",
+                 "callback_data": f"cancel_q:{request_id}"},
+            ]]
+        }
+        edit_message(req["msg_id"], banner, reply_markup=cancel_kb)
+        # Keep the original message_html so resolve_message still shows the
+        # question (not just the banner) when the answer finally arrives.
         req["waiting_for_text"] = True
         return
 
@@ -555,8 +802,8 @@ def handle_question_callback(request_id, choice, cb_id):
             labels = [options[i]["label"] for i in sorted(req["selected"])]
             answer = ", ".join(labels)
             answer_cb(cb_id, f"Submitted: {answer[:100]}")
-            edit_message(req["msg_id"],
-                         f"✅ <b>Selected:</b> {esc(answer)}")
+            resolve_message(req, "✅ <b>[ANSWERED]</b>",
+                            suffix=f"<b>Response:</b> {esc(answer)}")
             write_response(req["uuid"], {
                 "answer": answer,
                 "responded_at": int(time.time()),
@@ -599,7 +846,8 @@ def handle_question_callback(request_id, choice, cb_id):
 
     label = options[idx]["label"]
     answer_cb(cb_id, f"Selected: {label[:30]}")
-    edit_message(req["msg_id"], f"✅ <b>Selected:</b> {esc(label)}")
+    resolve_message(req, "✅ <b>[ANSWERED]</b>",
+                    suffix=f"<b>Response:</b> {esc(label)}")
     write_response(req["uuid"], {
         "answer": label,
         "responded_at": int(time.time()),
@@ -701,6 +949,11 @@ def handle_command(text):
             msg += "\nNo per-project overrides."
         if active_requests:
             msg += f"\n\n<b>Pending requests:</b> {len(active_requests)}"
+            waiting = [r for r in active_requests.values()
+                       if r.get("waiting_for_text")]
+            if waiting:
+                msg += (f"\n⚠️ <b>Waiting for text input:</b> {len(waiting)} "
+                        f"(send a message to answer)")
         send_message(msg)
         return True
     elif lower == "/quo":
@@ -743,7 +996,16 @@ def handle_command(text):
         msg += f"\n<b>Global default:</b> {esc(labels.get(state['default'], state['default']))}"
         send_message(msg)
         return True
-    elif lower in ("/projects", "/menu"):
+    elif lower == "/menu":
+        state = load_state()
+        mid = send_message(
+            format_menu_text(state),
+            reply_markup=build_menu_keyboard(state),
+        )
+        if mid:
+            menu_message_ids.add(mid)
+        return True
+    elif lower == "/projects":
         state = load_state()
         send_message(
             format_projects_text(state),
@@ -853,8 +1115,8 @@ def main():
                 # Check if any active request is waiting for free-text input
                 for rid, req in list(active_requests.items()):
                     if req["waiting_for_text"]:
-                        edit_message(req["msg_id"],
-                                     f"💬 <b>Answered:</b> {esc(text)}")
+                        resolve_message(req, "💬 <b>[ANSWERED]</b>",
+                                        suffix=f"<b>Response:</b> {esc(text)}")
                         write_response(req["uuid"], {
                             "answer": text,
                             "responded_at": int(time.time()),
